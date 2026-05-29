@@ -167,7 +167,7 @@ def agent_inference(
     debug_jsonl_path = None
     if debug:
         debug_folder_path = os.path.join(
-            debug_save_dir, f"{img_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}"
+            debug_save_dir, os.path.splitext(os.path.basename(img_path))[0]
         )
         debug_jsonl_path = os.path.join(debug_folder_path, "debug_history.json")
         os.makedirs(debug_folder_path, exist_ok=True)
@@ -555,7 +555,7 @@ def agent_inference(
 
     error_save_path = os.path.join(
         error_save_dir,
-        f"{img_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}_error_history.json",
+        f"{os.path.splitext(os.path.basename(img_path))[0]}_error_history.json",
     )
     with open(error_save_path, "w") as f:
         json.dump(messages, f, indent=4)

@@ -133,7 +133,14 @@ class Sam3BasePredictor:
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
             init_kwargs["video_loader_type"] = self.video_loader_type
-        inference_state = self.model.init_state(**init_kwargs)
+            
+        # --- FIX: Dynamically filter out parameters the model's init_state doesn't accept ---
+        import inspect
+        sig = inspect.signature(self.model.init_state)
+        filtered_init_kwargs = {k: v for k, v in init_kwargs.items() if k in sig.parameters}
+        
+        inference_state = self.model.init_state(**filtered_init_kwargs)
+        # ----------------───────────────────────────────────────────────────────────────────
 
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -318,68 +325,12 @@ class Sam3BasePredictor:
         run_gc_collect=True,
         clear_cache_threshold: int = _CLEAR_CACHE_THRESHOLD,
     ):
-        """Close a session. Idempotent.
-
-        ``run_gc_collect=True`` (the default) also returns the session's
-        freed CUDA tensors back to the device by calling
-        ``torch.cuda.empty_cache()`` after ``gc.collect()``. Without this,
-        PyTorch's caching allocator retains the freed allocations in its
-        per-process pool, so reserved memory keeps climbing across
-        long-running workloads even though the Python-level objects are gone.
-
-        ``empty_cache()`` itself triggers a CUDA sync, so it is gated on
-        device memory pressure via the ``gpu_mem`` snapshot. Callers can
-        override the threshold per-call via ``clear_cache_threshold``.
-
-        When ``run_gc_collect=True``, the response includes a ``gpu_mem``
-        snapshot (free / total / allocated / reserved bytes, plus active
-        session count) so clients can decide whether the device has
-        headroom for their next session — no separate admission RPC
-        needed. See ``_gpu_mem_snapshot`` for the field shape. The
-        first snapshot (after ``gc.collect()``) drives the cache-eviction
-        decision; if ``empty_cache()`` fires, a second snapshot is taken
-        so the response reflects the post-cleanup state and the freed
-        bytes are logged. Old callers that only read ``is_success`` work
-        unchanged — additional dict keys are ignored at the JSON layer.
-        """
+        """Close a session. Idempotent."""
         session = self._all_inference_states.pop(session_id, None)
         result = {"is_success": True}
         if session is None:
             logger.warning(f"cannot close session {session_id} as it does not exist")
         else:
-            # Explicitly clear the per-session dicts BEFORE ``del session``.
-            #
-            # ``inference_state`` (i.e., ``session["state"]``) is the dict
-            # built by ``init_state`` / ``_construct_initial_input_batch``
-            # and grown by ``add_prompt`` / propagation. It holds heavy
-            # GPU-resident references — ``input_batch`` (the video frames
-            # as a ``BatchedDatapoint`` on device),
-            # ``constants["empty_geometric_prompt"]`` (zeroed device
-            # tensors), and the per-inference accumulators
-            # ``feature_cache``, ``cached_frame_outputs``,
-            # ``tracker_inference_states``, ``tracker_metadata``.
-            #
-            # Empirically, relying on ``del session`` + ``gc.collect()``
-            # alone has been insufficient in prod: across long-lived
-            # IPNext replicas serving thousands of sessions, PyTorch's
-            # *allocated* bucket monotonically climbs to ~93 GiB even
-            # while ``empty_cache`` keeps *reserved-but-unallocated* at
-            # ~600 MiB, leading to OOMs at concurrency=1 (SAM3 client
-            # observation 2026-05-09 / 2026-05-10, jiids
-            # 37154706936429064 and 41658306563594281). The fingerprint:
-            #
-            #     this process has 94.99 GiB memory in use.
-            #     93.54 GiB allocated by PyTorch.
-            #     577.70 MiB reserved by PyTorch but unallocated.
-            #
-            # which is the signature of dict-keyed references staying
-            # alive (allocated bucket, not the cache). Calling ``clear()``
-            # on the nested dict immediately drops all per-session tensor
-            # refs the dict was keying, regardless of whether something
-            # else (closure, asyncio task, metrics buffer, parent
-            # container) is still holding the wrapper dict alive via a
-            # cycle. Lists in the inference state hold ``None``s for
-            # per-frame slots, so they don't need separate handling.
             state = session.get("state")
             if isinstance(state, dict):
                 state.clear()
@@ -409,35 +360,11 @@ class Sam3BasePredictor:
         return result
 
     def _gpu_mem_snapshot(self) -> dict:
-        """Snapshot of current GPU memory state for inclusion in
-        session-close responses.
-
-        Lets clients track free HBM across the fleet without a separate
-        admission RPC: every ``close_session`` naturally exposes the
-        post-cleanup state (taken AFTER any ``empty_cache`` call), which
-        is exactly what the next session will face.
-
-        Fields:
-          - ``free_bytes`` / ``total_bytes`` — raw
-            ``torch.cuda.mem_get_info()``.
-          - ``allocated_bytes`` — ``torch.cuda.memory_allocated()``,
-            live tensor footprint (no caching pool overhead).
-          - ``reserved_bytes`` — ``torch.cuda.memory_reserved()``,
-            caching-allocator pool size.
-          - ``free_pct`` — ``free_bytes / total_bytes * 100`` for
-            convenient % thresholds.
-          - ``active_session_count`` — sessions still resident on this
-            predictor instance after the close.
-
-        Fail-open: any error reading the device returns zero stats so
-        a broken CUDA context (e.g., CPU-only test env) NEVER breaks
-        the session-close response.
-        """
+        """Snapshot of current GPU memory state."""
         active_count = len(self._all_inference_states)
         try:
             free_bytes, total_bytes = torch.cuda.mem_get_info()
         except RuntimeError:
-            # No active CUDA context (e.g., CPU-only test env).
             return {
                 "free_bytes": 0,
                 "total_bytes": 0,
@@ -447,10 +374,6 @@ class Sam3BasePredictor:
                 "active_session_count": active_count,
             }
         free_pct = (free_bytes / total_bytes) * 100 if total_bytes > 0 else 0.0
-        # ``memory_allocated`` / ``memory_reserved`` are cheap host-side
-        # bookkeeping reads (no CUDA sync) and complement
-        # ``mem_get_info`` by exposing the caching-allocator pool size
-        # vs the actual live tensor footprint.
         allocated_bytes = (
             torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         )
